@@ -4,33 +4,33 @@
 #include <Poco/Net/HTTPServerRequest.h>
 #include <Poco/Net/HTTPServerResponse.h>
 #include <Poco/Net/ServerSocket.h>
-#include <Poco/Util/ServerApplication.h>
 #include <Poco/Data/Session.h>
 #include <Poco/Data/PostgreSQL/Connector.h>
-#include <Poco/Data/RecordSet.h>
 #include <Poco/Data/Statement.h>
 #include <Poco/JSON/Object.h>
 #include <Poco/JSON/Stringifier.h>
+#include <Poco/Exception.h>
+#include <thread>     
+#include <chrono>
 #include <iostream>
 #include <sstream>
 
 using namespace Poco::Net;
-using namespace Poco::Util;
 using namespace Poco::Data;
 using namespace Poco::Data::Keywords;
 using namespace Poco::JSON;
 using namespace std;
 
+// === PostgreSQL session helper ===
 Session createSession() {
     return Session("PostgreSQL", "host=yugabyte port=5433 user=postgres password=postgres dbname=postgres");
 }
 
-// === Handler for /add_task ===
+// === /add_task ===
 class AddTaskHandler : public HTTPRequestHandler {
 public:
     void handleRequest(HTTPServerRequest& request, HTTPServerResponse& response) override {
         Session session = createSession();
-
         string taskData;
         request.stream() >> taskData;
 
@@ -47,7 +47,7 @@ public:
     }
 };
 
-// === Handler for /get/<worker_id> ===
+// === /get/<worker_id> ===
 class GetTaskHandler : public HTTPRequestHandler {
 public:
     void handleRequest(HTTPServerRequest& request, HTTPServerResponse& response) override {
@@ -55,7 +55,7 @@ public:
         string workerId = uri.substr(uri.find_last_of('/') + 1);
 
         Session session = createSession();
-        Statement select(session), update(session);
+        Statement select(session);
 
         string taskId, taskData;
 
@@ -86,7 +86,7 @@ public:
             response.setContentType("text/plain");
             response.send() << taskData;
 
-        } catch (const Exception& ex) {
+        } catch (const Poco::Exception& ex) {
             session.rollback();
             response.setStatus(HTTPResponse::HTTP_INTERNAL_SERVER_ERROR);
             response.send() << "Error: " << ex.displayText();
@@ -94,7 +94,7 @@ public:
     }
 };
 
-// === Handler for /done/<task_id> ===
+// === /done/<task_id> ===
 class DoneTaskHandler : public HTTPRequestHandler {
 public:
     void handleRequest(HTTPServerRequest& request, HTTPServerResponse& response) override {
@@ -111,7 +111,7 @@ public:
     }
 };
 
-// === Handler for /fail/<task_id> ===
+// === /fail/<task_id> ===
 class FailTaskHandler : public HTTPRequestHandler {
 public:
     void handleRequest(HTTPServerRequest& request, HTTPServerResponse& response) override {
@@ -132,32 +132,28 @@ public:
 class TaskRequestFactory : public HTTPRequestHandlerFactory {
 public:
     HTTPRequestHandler* createRequestHandler(const HTTPServerRequest& request) override {
-        if (request.getURI().find("/add_task") == 0)
-            return new AddTaskHandler;
-        else if (request.getURI().find("/get/") == 0)
-            return new GetTaskHandler;
-        else if (request.getURI().find("/done/") == 0)
-            return new DoneTaskHandler;
-        else if (request.getURI().find("/fail/") == 0)
-            return new FailTaskHandler;
-        else
-            return nullptr;
+        const std::string& uri = request.getURI();
+
+        if (uri.find("/add_task") == 0) return new AddTaskHandler;
+        if (uri.find("/get/") == 0) return new GetTaskHandler;
+        if (uri.find("/done/") == 0) return new DoneTaskHandler;
+        if (uri.find("/fail/") == 0) return new FailTaskHandler;
+
+        return nullptr;
     }
 };
 
-// === Main App ===
+// === Main ===
 int main(int argc, char** argv) {
-    PostgreSQL::Connector::registerConnector();
+    Poco::Data::PostgreSQL::Connector::registerConnector();
     try {
         ServerSocket socket(9090);
         HTTPServer server(new TaskRequestFactory, socket, new HTTPServerParams);
         server.start();
         std::cout << "Task Queue Server running on port 9090...\n";
-        std::cout << "Waiting for termination...\n";
-        waitForTerminationRequest();
+        while (true) std::this_thread::sleep_for(std::chrono::seconds(1));
         server.stop();
-        std::cout << "Server stopped.\n";
-    } catch (const Exception& e) {
+    } catch (const Poco::Exception& e) {
         std::cerr << "Exception: " << e.displayText() << std::endl;
         return 1;
     }
