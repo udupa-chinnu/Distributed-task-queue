@@ -18,23 +18,6 @@ This project implements a **distributed task queue** using C++ with the **Poco l
 
 ---
 
-## 🐳 Docker Setup
-
-### 📁 Project Structure
-
-.
-├── docker-compose.yml
-├── server/
-│ ├── Dockerfile
-│ └── task_queue_server.cpp
-├── worker/
-│ ├── Dockerfile
-│ └── worker_node.cpp
-├── yb_data/ # Mounted volume for YugabyteDB data
-
-
----
-
 ## 🚀 How to Run
 
 ### 1️⃣ Start Everything
@@ -83,10 +66,10 @@ YugabyteDB is used with PostgreSQL compatibility.
 
 Tables are auto-created by the Task Queue Server:
 ```
-bash
+
 tasks(id TEXT PRIMARY KEY, status TEXT, payload TEXT, assigned_to TEXT)
 
 locks(id TEXT PRIMARY KEY, owner TEXT, acquired_at TIMESTAMPTZ)
 ```
 ### 🛑 Stop Everything
-```bash docker-compose down```
+```docker-compose down```
