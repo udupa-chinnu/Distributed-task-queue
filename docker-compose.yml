@@ -1,0 +1,91 @@
+version: '3.8'
+
+services:
+  yugabyte:
+    image: yugabytedb/yugabyte:latest
+    ports:
+      - "5433:5433"   # PostgreSQL client
+      - "7000:7000"   # Master UI
+      - "9000:9000"   # TServer UI
+    volumes:
+      - ./yb_data:/home/yugabyte/var/data
+    networks:
+      - task-network
+    command: [
+      "bash", "-c",
+      "rm -f /home/yugabyte/var/data/yugabyted.pid; \
+       rm -f /home/yugabyte/var/data/pg_data/postmaster.pid; \
+       /home/yugabyte/bin/yb-master \
+         --fs_data_dirs=/home/yugabyte/var/data \
+         --rpc_bind_addresses=0.0.0.0:7100 & \
+       sleep 5; \
+       /home/yugabyte/bin/yb-tserver \
+         --fs_data_dirs=/home/yugabyte/var/data \
+         --tserver_master_addrs=127.0.0.1:7100 \
+         --rpc_bind_addresses=0.0.0.0:9100 \
+         --server_broadcast_addresses=0.0.0.0:9100 \
+         --cql_proxy_bind_address=0.0.0.0:9042 \
+         --pgsql_proxy_bind_address=0.0.0.0:5433 \
+         --start_pgsql_proxy \
+         --ysql_hba_conf_csv=host all all 0.0.0.0/0 md5 \
+         --ysql_enable_auth=true \
+         --ysql_pg_conf_csv=password_encryption=md5 & \
+       until ysqlsh -U yugabyte -h 127.0.0.1 -p 5433 -c \"SELECT 1\" >/dev/null 2>&1; do \
+         echo 'Waiting for YSQL to start...'; sleep 2; \
+       done; \
+       ysqlsh -U yugabyte -h 127.0.0.1 -p 5433 -c \"ALTER USER postgres WITH PASSWORD 'postgres'\"; \
+       echo 'YugabyteDB ready'; \
+       tail -f /dev/null"
+    ]
+    healthcheck:
+      test: ["CMD-SHELL", "ysqlsh -U yugabyte -h 127.0.0.1 -p 5433 -c 'SELECT 1'"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+
+  task-queue-server:
+    image: task-queue-server:final
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    ports:
+      - "9090:9090"
+    depends_on:
+      yugabyte:
+        condition: service_healthy
+    environment:
+      DB_HOST: yugabyte
+      DB_PORT: 5433
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+    networks:
+      - task-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9090/add_task"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  worker:
+    image: worker:final
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    depends_on:
+      task-queue-server:
+        condition: service_healthy
+    environment:
+      SERVER_HOST: task-queue-server
+      SERVER_PORT: 9090
+    networks:
+      - task-network
+    deploy:
+      replicas: 3
+
+volumes:
+  yb_data:
+
+networks:
+  task-network:
+    driver: bridge
