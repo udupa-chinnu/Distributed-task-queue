@@ -3,46 +3,44 @@ version: '3.8'
 services:
   yugabyte:
     image: yugabytedb/yugabyte:latest
+    
     ports:
       - "5433:5433"   # PostgreSQL client
-      - "7000:7000"   # Master UI
+      - "7000:15433"   # Master UI
       - "9000:9000"   # TServer UI
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
     volumes:
-      - ./yb_data:/home/yugabyte/var/data
-    networks:
-      - task-network
+      - ./yb_data:/var/lib/yugabyte
     command: [
       "bash", "-c",
       "rm -f /home/yugabyte/var/data/yugabyted.pid; \
        rm -f /home/yugabyte/var/data/pg_data/postmaster.pid; \
-       /home/yugabyte/bin/yb-master \
-         --fs_data_dirs=/home/yugabyte/var/data \
-         --rpc_bind_addresses=0.0.0.0:7100 & \
-       sleep 5; \
-       /home/yugabyte/bin/yb-tserver \
-         --fs_data_dirs=/home/yugabyte/var/data \
-         --tserver_master_addrs=127.0.0.1:7100 \
-         --rpc_bind_addresses=0.0.0.0:9100 \
-         --server_broadcast_addresses=0.0.0.0:9100 \
-         --cql_proxy_bind_address=0.0.0.0:9042 \
-         --pgsql_proxy_bind_address=0.0.0.0:5433 \
-         --start_pgsql_proxy \
-         --ysql_hba_conf_csv=host all all 0.0.0.0/0 md5 \
-         --ysql_enable_auth=true \
-         --ysql_pg_conf_csv=password_encryption=md5 & \
+       /home/yugabyte/bin/yugabyted start \
+         --daemon=false \
+         --listen=0.0.0.0 \
+         --base_dir=/home/yugabyte/var \
+         --tserver_flags=pg_proxy_bind_address=0.0.0.0:5433 \
+         --tserver_flags='ysql_hba_conf_csv=host all all 0.0.0.0/0 md5' \
+         --tserver_flags='ysql_enable_auth=true' \
+         --tserver_flags='ysql_pg_conf_csv=password_encryption=md5' & \
        until ysqlsh -U yugabyte -h 127.0.0.1 -p 5433 -c \"SELECT 1\" >/dev/null 2>&1; do \
-         echo 'Waiting for YSQL to start...'; sleep 2; \
+         echo 'Waiting for YSQL to start...'; \
+         sleep 2; \
        done; \
        ysqlsh -U yugabyte -h 127.0.0.1 -p 5433 -c \"ALTER USER postgres WITH PASSWORD 'postgres'\"; \
        echo 'YugabyteDB ready'; \
        tail -f /dev/null"
     ]
     healthcheck:
-      test: ["CMD-SHELL", "ysqlsh -U yugabyte -h 127.0.0.1 -p 5433 -c 'SELECT 1'"]
+      test: ["CMD-SHELL", "PGPASSWORD=postgres ysqlsh -U postgres -h 127.0.0.1 -p 5433 -c 'SELECT 1'"]
       interval: 10s
       timeout: 5s
       retries: 30
       start_period: 60s
+    networks:
+      - task-network
 
   task-queue-server:
     image: task-queue-server:final

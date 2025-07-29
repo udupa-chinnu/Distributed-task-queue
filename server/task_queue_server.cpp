@@ -5,126 +5,160 @@
 #include <Poco/Net/HTTPServerResponse.h>
 #include <Poco/Net/ServerSocket.h>
 #include <Poco/Util/ServerApplication.h>
-#include <Poco/Util/OptionSet.h>
-#include <Poco/Util/Option.h>
-#include <Poco/Thread.h>
-#include <Poco/Mutex.h>
+#include <Poco/Data/Session.h>
+#include <Poco/Data/PostgreSQL/Connector.h>
+#include <Poco/Data/RecordSet.h>
+#include <Poco/Data/Statement.h>
 #include <Poco/JSON/Object.h>
-#include <Poco/JSON/Parser.h>
+#include <Poco/JSON/Stringifier.h>
 #include <iostream>
-#include <vector>
-#include <map>
 #include <sstream>
-#include <signal.h>
 
 using namespace Poco::Net;
 using namespace Poco::Util;
+using namespace Poco::Data;
+using namespace Poco::Data::Keywords;
 using namespace Poco::JSON;
 using namespace std;
 
-enum TaskStatus { PENDING, IN_PROGRESS, COMPLETED };
-
-struct Task {
-    string id;
-    string data;
-    TaskStatus status;
-};
-
-vector<Task> tasks;
-Poco::Mutex taskMutex;
-
-class TaskRequestHandler : public HTTPRequestHandler {
-public:
-    void handleRequest(HTTPServerRequest& request, HTTPServerResponse& response) override {
-        ostream& out = response.send();
-        response.setContentType("application/json");
-
-        if (request.getURI() == "/add_task" && request.getMethod() == "POST") {
-            handleAddTask(request, out);
-        } else if (request.getURI() == "/get_task") {
-            handleGetTask(out);
-        } else if (request.getURI().find("/complete_task?id=") != string::npos) {
-            handleCompleteTask(request, out);
-        } else {
-            response.setStatus(HTTPResponse::HTTP_NOT_FOUND);
-            out << "{\"error\":\"Endpoint not found\"}";
-        }
-    }
-
-private:
-    void handleAddTask(HTTPServerRequest& request, ostream& out) {
-        string body;
-        request.stream() >> body;
-
-        Poco::Mutex::ScopedLock lock(taskMutex);
-        string id = "task" + to_string(tasks.size() + 1);
-        tasks.push_back({id, body, PENDING});
-        out << "{\"status\":\"Task added\", \"id\":\"" << id << "\"}";
-        cout << "Task added: " << id << "\n";
-    }
-
-    void handleGetTask(ostream& out) {
-        Poco::Mutex::ScopedLock lock(taskMutex);
-        for (auto& task : tasks) {
-            if (task.status == PENDING) {
-                task.status = IN_PROGRESS;
-                out << "{\"id\":\"" << task.id << "\", \"data\":\"" << task.data << "\"}";
-                cout << "Assigned task: " << task.id << "\n";
-                return;
-            }
-        }
-        out << "{\"status\":\"No tasks available\"}";
-    }
-
-    void handleCompleteTask(HTTPServerRequest& request, ostream& out) {
-        string id = request.getURI().substr(request.getURI().find("=") + 1);
-        Poco::Mutex::ScopedLock lock(taskMutex);
-        for (auto& task : tasks) {
-            if (task.id == id && task.status == IN_PROGRESS) {
-                task.status = COMPLETED;
-                out << "{\"status\":\"Task marked as completed\"}";
-                cout << "Task completed: " << task.id << "\n";
-                return;
-            }
-        }
-        out << "{\"error\":\"Task not found or not in progress\"}";
-    }
-};
-
-class TaskRequestFactory : public HTTPRequestHandlerFactory {
-public:
-    HTTPRequestHandler* createRequestHandler(const HTTPServerRequest&) override {
-        return new TaskRequestHandler;
-    }
-};
-
-bool stopServer = false;
-
-void handleSignal(int signum) {
-    std::cout << "\nInterrupt signal (" << signum << ") received. Stopping server..." << std::endl;
-    stopServer = true;
+Session createSession() {
+    return Session("PostgreSQL", "host=yugabyte port=5433 user=postgres password=postgres dbname=postgres");
 }
 
-int main(int argc, char** argv) {
-    signal(SIGINT, handleSignal);
+// === Handler for /add_task ===
+class AddTaskHandler : public HTTPRequestHandler {
+public:
+    void handleRequest(HTTPServerRequest& request, HTTPServerResponse& response) override {
+        Session session = createSession();
 
+        string taskData;
+        request.stream() >> taskData;
+
+        Statement stmt(session);
+        stmt << "INSERT INTO tasks (data, status) VALUES ($1, 'pending')", use(taskData);
+        stmt.execute();
+
+        response.setStatus(HTTPResponse::HTTP_OK);
+        response.setContentType("application/json");
+        Object obj;
+        obj.set("status", "Task added");
+        obj.set("data", taskData);
+        obj.stringify(response.send());
+    }
+};
+
+// === Handler for /get/<worker_id> ===
+class GetTaskHandler : public HTTPRequestHandler {
+public:
+    void handleRequest(HTTPServerRequest& request, HTTPServerResponse& response) override {
+        string uri = request.getURI();
+        string workerId = uri.substr(uri.find_last_of('/') + 1);
+
+        Session session = createSession();
+        Statement select(session), update(session);
+
+        string taskId, taskData;
+
+        try {
+            session.begin();
+
+            select << R"(
+                UPDATE tasks SET status='in_progress', assigned_to=$1
+                WHERE id = (
+                    SELECT id FROM tasks WHERE status='pending'
+                    ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED
+                )
+                RETURNING id, data
+            )",
+            use(workerId), into(taskId), into(taskData);
+
+            if (select.execute() == 0) {
+                session.rollback();
+                response.setStatus(HTTPResponse::HTTP_OK);
+                response.setContentType("text/plain");
+                response.send() << "no task found";
+                return;
+            }
+
+            session.commit();
+
+            response.setStatus(HTTPResponse::HTTP_OK);
+            response.setContentType("text/plain");
+            response.send() << taskData;
+
+        } catch (const Exception& ex) {
+            session.rollback();
+            response.setStatus(HTTPResponse::HTTP_INTERNAL_SERVER_ERROR);
+            response.send() << "Error: " << ex.displayText();
+        }
+    }
+};
+
+// === Handler for /done/<task_id> ===
+class DoneTaskHandler : public HTTPRequestHandler {
+public:
+    void handleRequest(HTTPServerRequest& request, HTTPServerResponse& response) override {
+        string uri = request.getURI();
+        string taskId = uri.substr(uri.find_last_of('/') + 1);
+
+        Session session = createSession();
+        Statement stmt(session);
+        stmt << "UPDATE tasks SET status='done' WHERE id=$1", use(taskId);
+        stmt.execute();
+
+        response.setStatus(HTTPResponse::HTTP_OK);
+        response.send() << "Task " << taskId << " marked as done.";
+    }
+};
+
+// === Handler for /fail/<task_id> ===
+class FailTaskHandler : public HTTPRequestHandler {
+public:
+    void handleRequest(HTTPServerRequest& request, HTTPServerResponse& response) override {
+        string uri = request.getURI();
+        string taskId = uri.substr(uri.find_last_of('/') + 1);
+
+        Session session = createSession();
+        Statement stmt(session);
+        stmt << "UPDATE tasks SET status='failed' WHERE id=$1", use(taskId);
+        stmt.execute();
+
+        response.setStatus(HTTPResponse::HTTP_OK);
+        response.send() << "Task " << taskId << " marked as failed.";
+    }
+};
+
+// === Factory ===
+class TaskRequestFactory : public HTTPRequestHandlerFactory {
+public:
+    HTTPRequestHandler* createRequestHandler(const HTTPServerRequest& request) override {
+        if (request.getURI().find("/add_task") == 0)
+            return new AddTaskHandler;
+        else if (request.getURI().find("/get/") == 0)
+            return new GetTaskHandler;
+        else if (request.getURI().find("/done/") == 0)
+            return new DoneTaskHandler;
+        else if (request.getURI().find("/fail/") == 0)
+            return new FailTaskHandler;
+        else
+            return nullptr;
+    }
+};
+
+// === Main App ===
+int main(int argc, char** argv) {
+    PostgreSQL::Connector::registerConnector();
     try {
         ServerSocket socket(9090);
         HTTPServer server(new TaskRequestFactory, socket, new HTTPServerParams);
         server.start();
-        cout << "Server started on port 9090\n";
-
-        while (!stopServer) {
-            Poco::Thread::sleep(1000);
-        }
-
+        std::cout << "Task Queue Server running on port 9090...\n";
+        std::cout << "Waiting for termination...\n";
+        waitForTerminationRequest();
         server.stop();
-        cout << "Server stopped.\n";
-    } catch (const Poco::Exception& ex) {
-        cerr << "Poco Exception: " << ex.displayText() << endl;
-        return 1;
-    } catch (const std::exception& e) {
-        cerr << "Std Exception: " << e.what() << endl;
+        std::cout << "Server stopped.\n";
+    } catch (const Exception& e) {
+        std::cerr << "Exception: " << e.displayText() << std::endl;
         return 1;
     }
 
